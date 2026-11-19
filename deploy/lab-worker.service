@@ -1,0 +1,23 @@
+[Unit]
+Description=Video laboratory worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=labworker
+Group=labworker
+WorkingDirectory=/opt/video-lab
+EnvironmentFile=/etc/video-lab/worker.env
+ExecStart=/usr/bin/python3 /opt/video-lab/current/agent.py --coordinator ${COORDINATOR_URL} --source ${MOCK_URL} --id ${WORKER_ID} --threads ${WORKER_THREADS} --storage /var/lib/lab-worker
+Restart=on-failure
+RestartSec=3
+StateDirectory=lab-worker
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

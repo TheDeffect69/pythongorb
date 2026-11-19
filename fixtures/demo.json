@@ -1,0 +1,13 @@
+{
+  "delay_ms": 30,
+  "missing_every": 5,
+  "items": {
+    "1": {"media_statuses": [403]},
+    "2": {"media_statuses": [429, 200], "retry_after": 1},
+    "3": {"media_statuses": [500, 200]},
+    "4": {"download_allowed": false},
+    "5": {"media_statuses": [404]},
+    "6": {"size": 524288, "interrupt_downloads": 1},
+    "7": {"size": 131072, "interrupt_downloads": 1, "allow_range": false}
+  }
+}

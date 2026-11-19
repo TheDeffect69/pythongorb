@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Пульт координатора</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <script src="/ui/monitor.js" defer></script>
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+  <header class="mast">
+    <div class="brand"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span> Пульт координатора</div>
+    <div class="session"><span id="connection">Нет подключения</span><button id="session-button">Войти</button></div>
+  </header>
+  <main>
+    <div class="heading">
+      <div><h1>Обзор системы</h1><p id="updated">Данные координатора</p></div>
+      <button class="primary" id="new-job" disabled>Создать задание</button>
+    </div>
+    <div id="notice" role="status" hidden></div>
+    <details id="warnings" hidden><summary id="warning-count">Предупреждения</summary><ul id="warning-list"></ul></details>
+    <div class="summary" aria-label="Сводные показатели">
+      <article><h2>Работают</h2><strong id="running">—</strong><small>заданий</small></article>
+      <article><h2>Узлы на связи</h2><strong id="online">—</strong><small id="node-total">серверов</small></article>
+      <article><h2>Обработано</h2><strong id="processed">—</strong><small>идентификаторов</small></article>
+      <article><h2>Загружено</h2><strong id="files">—</strong><small>файлов</small></article>
+    </div>
+    <nav aria-label="Разделы"><button data-tab="jobs" aria-current="page">Задания</button><button data-tab="workers">Серверы</button><button data-tab="audit" id="audit-tab" hidden>Аудит</button></nav>
+    <section id="jobs-view">
+      <div class="section-head"><h2>Задания</h2><button id="refresh">Обновить</button></div>
+      <div id="jobs-list" class="scroll"></div>
+      <section id="job-detail" hidden>
+        <div class="section-head"><div><h2 id="job-title"></h2><p id="job-state"></p></div><div class="actions" id="job-actions"></div></div>
+        <dl class="facts" id="job-facts"></dl>
+        <div class="section-head"><h3>Результаты</h3><div class="actions"><input type="search" id="filter-id" placeholder="Поиск по ID" aria-label="Фильтр по ID"><select id="filter-status" aria-label="Фильтр по статусу"><option value="">Все статусы</option></select><button id="export">Скачать CSV</button></div></div>
+        <div class="scroll" id="items-list"></div>
+        <div class="pager"><button id="prev">Назад</button><span id="page"></span><button id="next">Далее</button></div>
+        <div class="section-head"><h3>События задания</h3><input type="search" id="filter-event" placeholder="Фильтр событий" aria-label="Фильтр событий"></div>
+        <div class="scroll" id="events-list"></div>
+      </section>
+    </section>
+    <section id="audit-view" hidden><div class="section-head"><h2>Аудит действий</h2><input type="search" id="audit-search" placeholder="Поиск по записям" aria-label="Поиск по записям аудита"></div><div class="scroll" id="audit-list"></div></section>
+    <section id="workers-view" hidden>
+      <div class="section-head"><h2>Рабочие серверы</h2></div>
+      <div class="scroll" id="workers-list"></div>
+      <section id="worker-detail" hidden>
+        <div class="section-head"><h2 id="worker-title"></h2><div id="worker-actions" class="actions"></div></div>
+        <dl class="facts" id="worker-facts"></dl>
+        <section id="service-panel" hidden>
+          <div class="section-head"><h3>Служба агента по SSH</h3><div id="service-actions" class="actions"></div></div>
+          <p id="service-result" class="hint" role="status"></p>
+        </section>
+        <h3>Последние метрики</h3>
+        <dl class="facts" id="worker-metrics"></dl>
+      </section>
+    </section>
+  </main>
+  <dialog id="auth-dialog"><form id="auth-form">
+    <h2>Подключение к координатору</h2>
+    <label>Токен доступа<input type="password" name="token" autocomplete="off" spellcheck="false" required></label>
+    <p class="hint">Токен действует в этой вкладке до выхода или перезагрузки страницы.</p>
+    <p class="form-error" role="alert"></p>
+    <div class="actions"><button type="button" data-close>Отмена</button><button class="primary">Подключиться</button></div>
+  </form></dialog>
+  <dialog id="job-dialog"><form id="job-form">
+    <h2>Новое задание</h2>
+    <label>Название<input name="name" maxlength="120" placeholder="Например, испытание стенда"></label>
+    <label>Диапазон ID<input name="range" placeholder="[0,999]"></label>
+    <p class="hint">[A,B] — обе границы включительно. A — от 0 до A. [A,] — от A без верхней границы. Пустое поле — от 0 без верхней границы.</p>
+    <div class="form-grid">
+      <label>Размер блока<input name="chunk_size" type="number" min="1" value="100" required></label>
+      <label>Потоков на узел<input name="threads" type="number" min="1" value="4" required></label>
+      <label>Общий лимит, запросов/с<input name="rate_limit" type="number" min="1" value="20" required></label>
+      <label>Максимум повторов<input name="max_retries" type="number" min="0" value="4" required></label>
+      <label>Тайм-аут HTTP, с<input name="request_timeout_seconds" type="number" min="1" value="20" required></label>
+      <label>Резерв диска, ГБ<input name="min_free_space_gb" type="number" min="0" step="any" value="0" required></label>
+    </div>
+    <details><summary>Условия остановки</summary><div class="form-grid">
+      <label>Лимит ID<input name="max_items" type="number" min="1" placeholder="Без ограничения"></label>
+      <label>Лимит времени, с<input name="max_seconds" type="number" min="1" placeholder="Без ограничения"></label>
+      <label>Отсутствующих ID подряд<input name="stop_on_consecutive_missing" type="number" min="1" placeholder="Отключено"></label>
+    </div></details>
+    <label>Рабочие серверы<select name="worker_ids" multiple aria-describedby="workers-help"></select></label><p class="hint" id="workers-help">Без выбора используются все доступные серверы.</p>
+    <p class="form-error" role="alert"></p>
+    <div class="actions"><button type="button" data-close>Отмена</button><button class="primary">Создать</button></div>
+  </form></dialog>
+  <dialog id="settings-dialog"><form id="settings-form">
+    <h2 id="settings-title"></h2><div id="settings-fields" class="form-grid"></div>
+    <p class="form-error" role="alert"></p>
+    <div class="actions"><button type="button" data-close>Отмена</button><button class="primary">Применить</button></div>
+  </form></dialog>
+  <dialog id="confirm-dialog"><form id="confirm-form">
+    <h2 id="confirm-title"></h2><p id="confirm-text"></p><p class="form-error" role="alert"></p>
+    <div class="actions"><button type="button" data-close>Отмена</button><button class="danger">Подтвердить</button></div>
+  </form></dialog>
+</body>
+</html>

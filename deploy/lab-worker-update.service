@@ -1,0 +1,12 @@
+[Unit]
+Description=Activate the locally staged and verified video laboratory agent
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/video-lab/deploy/worker_release.py activate
+TimeoutStartSec=100
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/video-lab
+ProtectHome=true
