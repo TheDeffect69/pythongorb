@@ -1,0 +1,12 @@
+ALTER TABLE jobs ADD COLUMN check_rps INTEGER;
+ALTER TABLE jobs ADD COLUMN download_rps INTEGER;
+ALTER TABLE jobs ADD COLUMN last_dispatched_at REAL NOT NULL DEFAULT 0;
+ALTER TABLE workers ADD COLUMN worker_rps INTEGER;
+ALTER TABLE workers ADD COLUMN check_rps INTEGER;
+ALTER TABLE workers ADD COLUMN download_rps INTEGER;
+ALTER TABLE workers ADD COLUMN min_free_space_gb REAL;
+ALTER TABLE job_workers ADD COLUMN threads INTEGER;
+ALTER TABLE job_workers ADD COLUMN worker_rps INTEGER;
+ALTER TABLE job_workers ADD COLUMN check_rps INTEGER;
+ALTER TABLE job_workers ADD COLUMN download_rps INTEGER;
+ALTER TABLE job_workers ADD COLUMN min_free_space_gb REAL;

@@ -1,0 +1,19 @@
+{
+  "job": {
+    "name": "Проверка стенда",
+    "range": {"from": 0, "to": 500000},
+    "threads": 4,
+    "chunk_size": 1000,
+    "request_timeout_seconds": 20,
+    "max_retries": 4,
+    "global_rate_limit_rps": 20,
+    "check_rps": 15,
+    "download_rps": 8,
+    "stop_on_consecutive_missing": null
+  },
+  "servers": [
+    {"name":"worker-01","host":"192.168.10.11","ssh_port":22,"ssh_user":"downloader","ssh_key":"/run/secrets/worker-01-key","threads":8,"storage_path":"/data/videos","min_free_space_gb":20},
+    {"name":"worker-02","host":"192.168.10.12","ssh_port":22,"ssh_user":"downloader","ssh_key":"/run/secrets/worker-02-key","threads":16,"storage_path":"/data/videos","min_free_space_gb":50},
+    {"name":"worker-03","host":"192.168.10.13","ssh_port":22,"ssh_user":"downloader","ssh_auth":"agent","storage_path":"/data/videos","worker_rps":8,"check_rps":6,"download_rps":3,"min_free_space_gb":10}
+  ]
+}

@@ -33,7 +33,9 @@ def main():
     parser.add_argument("--state", type=Path, default=Path(".lab"))
     parser.add_argument("--port", type=int, default=8090)
     parser.add_argument("--mock-port", type=int, default=8091)
-    parser.add_argument("--catalog", type=Path, help="Manifest of local files with download permissions")
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument("--catalog", type=Path, help="Manifest of local files with download permissions")
+    sources.add_argument("--kinescope-index", type=Path, help="Index of videos in the Kinescope workspace")
     args = parser.parse_args()
     state = args.state.resolve()
     tokens = credentials(state)
@@ -53,14 +55,22 @@ def main():
                                           env=env, cwd=PROJECT)
 
     try:
-        profile = ["--catalog", args.catalog.resolve()] if args.catalog else ["--config", PROJECT/"fixtures/demo.json"]
-        start("mock", "mock_service.py", ["--port", args.mock_port, *profile])
+        worker_env = {}
+        if args.kinescope_index:
+            if not os.getenv("LAB_KINESCOPE_TOKEN") or not args.kinescope_index.is_file():
+                parser.error("Kinescope requires an index file and LAB_KINESCOPE_TOKEN")
+            source = "kinescope"
+            worker_env.update(LAB_KINESCOPE_TOKEN=os.environ["LAB_KINESCOPE_TOKEN"],
+                              LAB_KINESCOPE_INDEX=str(args.kinescope_index.resolve()))
+        else:
+            profile = ["--catalog", args.catalog.resolve()] if args.catalog else ["--config", PROJECT/"fixtures/demo.json"]
+            start("mock", "mock_service.py", ["--port", args.mock_port, *profile])
         api_env = {f"LAB_{role.upper()}_TOKEN": tokens[role] for role in ("admin", "operator", "viewer")}
         api_env["LAB_WORKER_TOKENS"] = json.dumps({w: tokens[w] for w in WORKERS})
         start("coordinator", "coordinator.py", ["--port", args.port, "--db", state/"lab.sqlite"], api_env)
         for name, threads in zip(WORKERS, (4, 8, 12)):
             start(name, "agent.py", ["--coordinator", base, "--source", source, "--id", name,
-                  "--threads", threads, "--storage", state/name], {"LAB_WORKER_TOKEN": tokens[name]})
+                  "--threads", threads, "--storage", state/name], {**worker_env, "LAB_WORKER_TOKEN": tokens[name]})
         ready_since = time.monotonic()
         print(f"Панель: {base}\nЛокальные ключи ролей: {state/'credentials.json'}\nОстановка стенда: Ctrl+C",
               flush=True)

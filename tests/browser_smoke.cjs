@@ -18,11 +18,12 @@ async function main() {
   const state = fs.mkdtempSync(path.join(os.tmpdir(), "video-lab-ui-"));
   const secret = () => crypto.randomBytes(32).toString("hex");
   const admin = secret();
+  const workerToken = secret();
   const server = spawn(process.env.LAB_PYTHON || "python", [
     "coordinator.py", "--port", String(port), "--db", path.join(state, "test.sqlite")
   ], { cwd: path.resolve(__dirname, ".."), windowsHide: true, env: {
     ...process.env, LAB_ADMIN_TOKEN: admin, LAB_OPERATOR_TOKEN: secret(),
-    LAB_VIEWER_TOKEN: secret(), LAB_WORKER_TOKENS: JSON.stringify({w: secret()})
+    LAB_VIEWER_TOKEN: secret(), LAB_WORKER_TOKENS: JSON.stringify({w: workerToken})
   } });
   const stopped = once(server, "exit");
   let browser;
@@ -34,6 +35,10 @@ async function main() {
       if (!ready) await new Promise(resolve => setTimeout(resolve, 100));
     }
     assert.ok(ready, "coordinator did not become ready");
+    const registered = await fetch(origin + "/api/workers/register", { method: "POST",
+      headers: { Authorization: "Bearer " + workerToken, "Content-Type": "application/json" },
+      body: JSON.stringify({id: "w", storage_path: state, threads: 2}) });
+    assert.ok(registered.ok);
     browser = await chromium.launch({ headless: true, executablePath: process.env.LAB_CHROMIUM });
     const page = await browser.newPage();
     const errors = [];
@@ -45,10 +50,25 @@ async function main() {
     await page.locator("#new-job").click();
     await page.locator("[name=name]").fill("Проверка интерфейса");
     await page.locator("[name=range]").fill("[1,3]");
+    await page.locator("#job-form [name=check_rps]").fill("8");
+    await page.locator("#job-form [name=download_rps]").fill("3");
     await page.locator("#job-form button.primary").click();
     await page.locator("#job-title").filter({ hasText: "Проверка интерфейса" }).waitFor();
+    await page.locator("#job-actions").getByRole("button", {name:"Настройки",exact:true}).click();
+    assert.equal(await page.locator("#settings-form [name=check_rps]").inputValue(), "8");
+    await page.locator("#settings-form [name=download_rps]").fill("2");
+    await page.locator("#settings-form button.primary").click();
+    await page.locator("#settings-dialog").waitFor({state:"hidden"});
+    const read = async path => (await fetch(origin + "/api/" + path, {headers:{Authorization:"Bearer " + admin}})).json();
+    assert.equal((await read("jobs"))[0].download_rps, 2);
     await page.locator("[data-tab=workers]").click();
     await page.locator("#workers-view").waitFor();
+    await page.getByRole("button",{name:"Настройки узла"}).click();
+    await page.locator("#settings-form [name=worker_rps]").fill("7");
+    await page.locator("#settings-form [name=check_rps]").fill("4");
+    await page.locator("#settings-form button.primary").click();
+    await page.locator("#settings-dialog").waitFor({state:"hidden"});
+    assert.equal((await read("workers/w")).worker_rps, 7);
     await page.locator("[data-tab=audit]").click();
     await page.locator("#audit-list").getByText("create", { exact: true }).waitFor();
     await page.setViewportSize({ width: 390, height: 844 });

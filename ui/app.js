@@ -134,7 +134,7 @@ function renderJob(j) {
   if (!j) return;
   el("job-title").textContent=j.name||"Задание "+j.id;
   el("job-state").textContent=(statusText[j.status]||j.status)+" · "+j.id;
-  const count=j.range_end==null?null:j.range_end-j.range_start+1;
+  const count="total_items" in j ? j.total_items : (j.range_end==null?null:j.range_end-j.range_start+1);
   const active=state.workers.filter(w=>w.online && w.current_chunk?.job_id===j.id);
   const sum=k=>active.reduce((total,w)=>total+(Number(w.metrics?.[k])||0),0);
   facts("job-facts",[
@@ -146,6 +146,8 @@ function renderJob(j) {
     ["Занятые потоки",num(sum("active_checks")+sum("active_downloads"))],["Активные загрузки",num(sum("active_downloads"))],
     ["Оставшееся время",count==null?"Не определено":duration(j.eta_seconds)],
     ["Потоков на узел",num(j.threads)],["Общий лимит, запросов/с",num(j.rate_limit)],
+    ["Лимит проверок, запросов/с",j.check_rps==null?"Общий бюджет":num(j.check_rps)],
+    ["Лимит загрузок, запросов/с",j.download_rps==null?"Общий бюджет":num(j.download_rps)],
     ["Размер блока",num(j.chunk_size)],["Блоков в очереди",num(j.queue_size)],
     ["Старейший блок в очереди",j.queue_size?duration(j.oldest_queued_seconds):"Очередь пуста"],
     ["Последний прогресс",time(j.last_progress_at)],["Создано",time(j.created_at)]
@@ -164,15 +166,36 @@ function renderJob(j) {
     },action==="stop"?"danger":""));
   }
   actions.append(button("Настройки",()=>settings("Параметры задания",jobPath(j.id),[
-    ["threads","Потоков на узел",j.threads,1],["rate_limit","Общий лимит, запросов/с",j.rate_limit,1]
+    ["threads","Потоков на узел",j.threads,1],["rate_limit","Общий лимит, запросов/с",j.rate_limit,1],
+    ["check_rps","Проверки, запросов/с",j.check_rps,1,true],["download_rps","Загрузки, запросов/с",j.download_rps,1,true]
   ],j.worker_ids||[])));
 }
 function renderItems() {
-  table("items-list",["ID","Статус","Материал","Сервер","Размер","Диагностика"],state.items.map(i=>({cells:[
-    i.external_id,pill(i.status),i.metadata?.title,i.worker_id,size(i.file?.size??i.file?.size_bytes??i.metadata?.size),
-    i.error||"—"]})),"Записей с такими параметрами пока нет.");
+  const states=el("items-mode").value==="states";
+  const headers=states?["ID","Статус","Сервер","Блок","Попытка","Время"]:["ID","Статус","Материал","Сервер","Размер","Диагностика"];
+  table("items-list",headers,state.items.map(i=>({cells:[
+    button(String(i.external_id),()=>showHistory(state.job,i.external_id),"link"),pill(i.status),...(states?
+      [i.worker_id,i.chunk_id,i.attempt,time(i.ts)]:[i.metadata?.title,i.worker_id,size(i.file?.size??i.file?.size_bytes??i.metadata?.size),i.error||"—"])]})),
+    "Записей с такими параметрами пока нет.");
+  el("export").hidden=states;
   el("page").textContent="Страница "+(1+Math.floor(state.offset/limit));
   el("prev").disabled=state.offset===0; el("next").disabled=state.items.length<limit;
+}
+let historyRequest=0;
+async function showHistory(job,id,offset=0) {
+  const dialog=el("history-dialog"), ticket=++historyRequest;
+  if (!dialog.open) dialog.showModal();
+  el("history-title").textContent="История ID "+id;
+  el("history-list").textContent="Загрузка…";
+  el("history-prev").disabled=true;el("history-next").disabled=true;
+  try {
+    const rows=await request(jobPath(job)+"/items/"+encodeURIComponent(id)+"/history?limit="+limit+"&offset="+offset);
+    if (!dialog.open || ticket!==historyRequest) return;
+    table("history-list",["Время","Статус","Узел","Попытка"],rows.map(i=>({cells:[time(i.ts),pill(i.status),i.worker_id,i.attempt]})),"История пока пуста.");
+    el("history-prev").disabled=offset===0;el("history-next").disabled=rows.length<limit;
+    el("history-prev").onclick=()=>showHistory(job,id,offset-limit);
+    el("history-next").onclick=()=>showHistory(job,id,offset+limit);
+  } catch(err) { if (ticket===historyRequest) el("history-list").textContent=err.message; }
 }
 function renderEvents(id,source,term) {
   const rows=source.filter(e=>Object.values(e).join(" ").toLowerCase().includes(term.toLowerCase()));
@@ -210,7 +233,10 @@ function renderWorker(w) {
   facts("worker-metrics",display.length?display:[["Состояние","Ожидание первого отчёта агента"]]);
   const host=el("worker-actions");host.replaceChildren();
   if (!operate()) return;
-  host.append(button("Число потоков",()=>settings("Параметры узла",workerPath(w.id),[["threads","Потоки",w.thread_override??w.threads,1]])));
+  host.append(button("Настройки узла",()=>settings("Параметры узла",workerPath(w.id),[
+    ["threads","Потоки",w.thread_override,1,true],["worker_rps","Общий лимит узла, запросов/с",w.worker_rps,1,true],
+    ["check_rps","Проверки, запросов/с",w.check_rps,1,true],["download_rps","Загрузки, запросов/с",w.download_rps,1,true]
+  ])));
   host.append(button(w.enabled?"Отключить":"Включить",()=>{
     const exec=()=>request(workerPath(w.id),"PATCH",{enabled:!w.enabled});
     if (w.enabled) confirmAction("Отключить узел","Координатор прекратит выдавать узлу новые блоки.",exec);
@@ -273,7 +299,7 @@ async function refresh() {
       renderJob(j);
       if (j) {
         const params=query(); params.set("limit",limit); params.set("offset",state.offset);
-        const [items,events]=await Promise.all([request(jobPath(j.id)+"/items?"+params),request(jobPath(j.id)+"/events")]);
+        const [items,events]=await Promise.all([request(jobPath(j.id)+"/"+el("items-mode").value+"?"+params),request(jobPath(j.id)+"/events")]);
         if (generation!==state.generation) return;
         state.items=items;state.events=events;renderItems();renderEvents("events-list",events,el("filter-event").value);
       }
@@ -319,9 +345,10 @@ function formAction(formId, fn) {
 async function run(fn) { try { await fn();notice("");await refresh(); } catch(err) { notice(err.message); } }
 function settings(title,path,specs,workerIds) {
   el("settings-title").textContent=title;
-  el("settings-fields").replaceChildren(...specs.map(([name,title,value,min])=>{
+  el("settings-fields").replaceChildren(...specs.map(([name,title,value,min,optional])=>{
     const label=node("label",title),input=node("input");
-    Object.assign(input,{name,type:"number",min,value:value??min,required:true});label.append(input);return label;
+    Object.assign(input,{name,type:"number",min,value:value??(optional?"":min),required:!optional,
+      placeholder:optional?"По умолчанию":""});label.append(input);return label;
   }));
   if (workerIds) {
     const label=node("label","Рабочие серверы (без выбора — все)"),select=node("select");
@@ -330,7 +357,7 @@ function settings(title,path,specs,workerIds) {
     el("settings-fields").append(label);
   }
   formAction("settings-form",form=>{
-    const data=Object.fromEntries(specs.map(([key])=>[key,Number(form.get(key))]));
+    const data=Object.fromEntries(specs.map(([key])=>[key,form.get(key)===""?null:Number(form.get(key))]));
     if (workerIds) data.worker_ids=form.getAll("worker_ids");
     return request(path,"PATCH",data);
   });
@@ -349,7 +376,7 @@ formAction("auth-form",async form=>{
 formAction("job-form",async form=>{
   const data=Object.fromEntries(form);
   if (!data.name.trim()) delete data.name;
-  for (const key of ["max_items","max_seconds","stop_on_consecutive_missing"]) data[key]=data[key]===""?null:Number(data[key]);
+  for (const key of ["max_items","max_seconds","stop_on_consecutive_missing","check_rps","download_rps"]) data[key]=data[key]===""?null:Number(data[key]);
   for (const key of ["threads","rate_limit","chunk_size","max_retries","request_timeout_seconds","min_free_space_gb"]) data[key]=Number(data[key]);
   data.worker_ids=form.getAll("worker_ids");if (!data.worker_ids.length) delete data.worker_ids;
   const created=await request("/jobs","POST",data);
@@ -369,6 +396,7 @@ function page(offset) {state.offset=offset;state.generation++;refresh();}
 let delay;
 el("filter-id").oninput=()=>{clearTimeout(delay);delay=setTimeout(()=>page(0),250);};
 el("filter-status").onchange=()=>page(0);
+el("items-mode").onchange=()=>page(0);
 el("filter-event").oninput=()=>renderEvents("events-list",state.events,el("filter-event").value);
 el("audit-search").oninput=()=>renderEvents("audit-list",state.audit,el("audit-search").value);
 el("prev").onclick=()=>page(Math.max(0,state.offset-limit)); el("next").onclick=()=>page(state.offset+limit);

@@ -34,7 +34,7 @@
       <section id="job-detail" hidden>
         <div class="section-head"><div><h2 id="job-title"></h2><p id="job-state"></p></div><div class="actions" id="job-actions"></div></div>
         <dl class="facts" id="job-facts"></dl>
-        <div class="section-head"><h3>Результаты</h3><div class="actions"><input type="search" id="filter-id" placeholder="Поиск по ID" aria-label="Фильтр по ID"><select id="filter-status" aria-label="Фильтр по статусу"><option value="">Все статусы</option></select><button id="export">Скачать CSV</button></div></div>
+        <div class="section-head"><h3>Материалы</h3><div class="actions"><select id="items-mode" aria-label="Вид записей"><option value="items">Результаты</option><option value="states">Текущие состояния</option></select><input type="search" id="filter-id" placeholder="Поиск по ID" aria-label="Фильтр по ID"><select id="filter-status" aria-label="Фильтр по статусу"><option value="">Все статусы</option></select><button id="export">Скачать CSV</button></div></div>
         <div class="scroll" id="items-list"></div>
         <div class="pager"><button id="prev">Назад</button><span id="page"></span><button id="next">Далее</button></div>
         <div class="section-head"><h3>События задания</h3><input type="search" id="filter-event" placeholder="Фильтр событий" aria-label="Фильтр событий"></div>
@@ -73,6 +73,8 @@
       <label>Размер блока<input name="chunk_size" type="number" min="1" value="100" required></label>
       <label>Потоков на узел<input name="threads" type="number" min="1" value="4" required></label>
       <label>Общий лимит, запросов/с<input name="rate_limit" type="number" min="1" value="20" required></label>
+      <label>Проверки, запросов/с<input name="check_rps" type="number" min="1" max="10000" placeholder="Без доп. лимита"></label>
+      <label>Загрузки, запросов/с<input name="download_rps" type="number" min="1" max="10000" placeholder="Без доп. лимита"></label>
       <label>Максимум повторов<input name="max_retries" type="number" min="0" value="4" required></label>
       <label>Тайм-аут HTTP, с<input name="request_timeout_seconds" type="number" min="1" value="20" required></label>
       <label>Резерв диска, ГБ<input name="min_free_space_gb" type="number" min="0" step="any" value="0" required></label>
@@ -91,6 +93,10 @@
     <p class="form-error" role="alert"></p>
     <div class="actions"><button type="button" data-close>Отмена</button><button class="primary">Применить</button></div>
   </form></dialog>
+  <dialog id="history-dialog"><h2 id="history-title"></h2>
+    <div id="history-list" class="scroll"></div>
+    <div class="pager"><button id="history-prev">Назад</button><button id="history-next">Далее</button><button data-close>Закрыть</button></div>
+  </dialog>
   <dialog id="confirm-dialog"><form id="confirm-form">
     <h2 id="confirm-title"></h2><p id="confirm-text"></p><p class="form-error" role="alert"></p>
     <div class="actions"><button type="button" data-close>Отмена</button><button class="danger">Подтвердить</button></div>

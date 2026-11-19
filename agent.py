@@ -34,6 +34,12 @@ class SourceError(Exception):
         self.retry_after = retry_after
 
 
+class DiskUnavailable(SourceError):
+    def __init__(self, required_free_bytes):
+        super().__init__("retry_wait", "insufficient_disk")
+        self.required_free_bytes = required_free_bytes
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -59,8 +65,8 @@ def stamp():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def digest(path, cancel):
-    sha = hashlib.sha256()
+def digest(path, cancel, algorithm="sha256"):
+    sha = hashlib.new(algorithm, usedforsecurity=False)
     with path.open("rb") as stream:
         while block := stream.read(1024 * 1024):
             cancel()
@@ -76,7 +82,7 @@ def confined(root, path):
 
 def check_disk(root, reserve_bytes, remaining=0):
     if shutil.disk_usage(root).free < reserve_bytes + remaining:
-        raise SourceError("retry_wait", "insufficient_disk")
+        raise DiskUnavailable(reserve_bytes + remaining)
 
 
 def save_json(path, record):
@@ -112,43 +118,132 @@ class Fixture:
 
     def open(self, path, timeout, headers=None):
         req = urllib.request.Request(self.url(path), headers=headers or {})
-        try:
-            return self.http.open(req, timeout=timeout)
-        except urllib.error.HTTPError as err:
-            with err:
-                code = err.code
-                wait = retry_seconds(err.headers.get("Retry-After"))
-            if code in {401, 403}:
-                raise SourceError("forbidden", f"http_{code}") from None
-            if code == 404:
-                raise SourceError("not_found", "http_404") from None
-            if code == 429:
-                raise SourceError("rate_limited", "http_429", wait) from None
-            if code >= 500 or code == 408:
-                raise SourceError("retry_wait", f"http_{code}", wait) from None
-            raise SourceError("failed", f"http_{code}") from None
-        except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.HTTPException):
-            raise SourceError("retry_wait", "source_connection") from None
+        return open_source(self.http, req, timeout)
+
+    def metadata(self, item, timeout, permit, report):
+        route = f"/media/{item}"
+        permit("check")
+        with self.open(route, timeout) as response:
+            report(response.status)
+            data = read_json(response, 65536)
+        if not isinstance(data, dict):
+            raise SourceError("failed", "invalid_metadata")
+        if data.get("source_url") != f"https://kinescope.io/{item}":
+            data["source_url"] = self.url(route)
+        return data
+
+
+def read_json(response, limit):
+    raw = response.read(limit + 1)
+    if len(raw) > limit:
+        raise SourceError("failed", "oversize_metadata")
+    return json.loads(raw)
+
+
+def open_source(opener, req, timeout):
+    try:
+        return opener.open(req, timeout=timeout)
+    except urllib.error.HTTPError as err:
+        with err:
+            code = err.code
+            wait = retry_seconds(err.headers.get("Retry-After"))
+        if code in {401, 403}:
+            raise SourceError("forbidden", f"http_{code}") from None
+        if code == 404:
+            raise SourceError("not_found", "http_404") from None
+        if code == 429:
+            raise SourceError("rate_limited", "http_429", wait) from None
+        if code >= 500 or code == 408:
+            raise SourceError("retry_wait", f"http_{code}", wait) from None
+        raise SourceError("failed", f"http_{code}") from None
+    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.HTTPException):
+        raise SourceError("retry_wait", "source_connection") from None
+
+
+class Kinescope:
+    """Access videos in the operator's workspace via the documented Video API."""
+
+    api = "https://api.kinescope.io/v1/videos"
+
+    def __init__(self, index, token):
+        if not token or not token.isascii() or any(not 33 <= ord(c) <= 126 for c in token):
+            raise ValueError("LAB_KINESCOPE_TOKEN is required")
+        if not isinstance(index, dict) or not all(
+            re.fullmatch(r"0|[1-9][0-9]{0,18}", key) and isinstance(value, str)
+            and re.fullmatch(r"[a-zA-Z0-9-]{1,80}", value) for key, value in index.items()
+        ):
+            raise ValueError("Expected a mapping of numeric lab IDs to Kinescope video IDs")
+        self.index = index
+        self.token = token
+        self.http = urllib.request.build_opener(NoRedirect())
+
+    def api_json(self, suffix, timeout):
+        req = urllib.request.Request(self.api + suffix, headers={"Authorization": "Bearer " + self.token})
+        with open_source(self.http, req, timeout) as response:
+            return read_json(response, 8 * 1024 * 1024)
+
+    @staticmethod
+    def url(link):
+        u = urllib.parse.urlsplit(link)
+        if (u.scheme != "https" or u.username is not None or u.password is not None or u.fragment
+                or u.port not in (None, 443) or not u.hostname
+                or not any(u.hostname == d or u.hostname.endswith("." + d)
+                           for d in ("kinescope.io", "kinescopecdn.net"))):
+            raise SourceError("failed", "invalid_download_origin")
+        return link
+
+    def open(self, path, timeout, headers=None):
+        req = urllib.request.Request(self.url(path), headers=headers or {})
+        return open_source(self.http, req, timeout)
+
+    def metadata(self, item, timeout, permit, report):
+        video_id = self.index.get(str(item))
+        if video_id is None:
+            raise SourceError("skipped", "outside_workspace_index")
+        permit("check")
+        video = self.api_json("/" + video_id, timeout)["data"]
+        report(200)
+        if video.get("id") != video_id:
+            raise SourceError("failed", "unexpected_video_id")
+        page = video.get("play_link", "")
+        if not re.fullmatch(r"https://kinescope\.io/[a-zA-Z0-9-]+/?", page):
+            raise SourceError("failed", "invalid_player_url")
+        permit("check")
+        with self.open(page, timeout) as response:
+            report(response.status)
+        info = dict(id=item, source_url=page, title=video["title"], download_allowed=False)
+        assets = [a for a in (video.get("assets") or []) if isinstance(a, dict) and a.get("download_link")]
+        if video.get("status") == "done" and assets:
+            asset = next((a for a in assets if a.get("quality") == "original"), assets[0])
+            mime = {"mp4":"video/mp4", "webm":"video/webm", "mov":"video/quicktime", "ts":"video/mp2t"}
+            info.update(download_allowed=True, download_url=self.url(asset["download_link"]),
+                        size=asset["file_size"], md5=asset.get("md5"),
+                        mime_type=mime.get(asset.get("filetype"), "application/octet-stream"))
+        return info
 
 
 def download(source, route, item_id, expected_size, expected_hash, root, timeout,
              reserve, permit, cancel, on_bytes=lambda n: None, on_start=lambda status, offset: None,
-             mime_type="video/mp4"):
+             mime_type="video/mp4", hash_type="sha256"):
     """Return a verified final file; an interrupted stream leaves a recoverable .part."""
     if type(item_id) is not int or item_id < 0 or type(expected_size) is not int or expected_size < 0:
         raise SourceError("failed", "invalid_metadata")
-    if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
+    length = {"sha256":64,"md5":32}.get(hash_type)
+    if not length or (expected_hash is not None and (not isinstance(expected_hash, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{%d}" % length, expected_hash))):
         raise SourceError("failed", "invalid_checksum")
-    expected_hash = expected_hash.lower()
+    if expected_hash is not None:
+        expected_hash = expected_hash.lower()
     root = Path(root).resolve()
     folder = confined(root, root / str(item_id)[:3] / str(item_id))
     folder.mkdir(parents=True, exist_ok=True)
-    suffix = {"video/mp4":"mp4", "video/webm":"webm", "video/quicktime":"mov"}.get(mime_type, "bin")
+    suffix = {"video/mp4":"mp4", "video/webm":"webm", "video/quicktime":"mov", "video/mp2t":"ts"}.get(mime_type, "bin")
     target = confined(root, folder / ("video." + suffix))
     part = confined(root, folder / ("video." + suffix + ".part"))
 
     def valid(path):
-        return path.stat().st_size == expected_size and digest(path, cancel) == expected_hash
+        return (expected_hash is not None and path.stat().st_size == expected_size
+                and digest(path, cancel, hash_type) == expected_hash)
 
     if target.is_file() and valid(target):
         return target
@@ -159,7 +254,8 @@ def download(source, route, item_id, expected_size, expected_hash, root, timeout
             part.replace(target)
             return target
         part.unlink()
-    offset = part.stat().st_size if part.exists() else 0
+    offset = part.stat().st_size if expected_hash is not None and part.exists() else 0
+    transfer_hash = hashlib.sha256() if expected_hash is None else None
     check_disk(root, reserve, expected_size - offset)
     permit("download")
     cancel()
@@ -194,6 +290,8 @@ def download(source, route, item_id, expected_size, expected_hash, root, timeout
                         raise SourceError("failed", "oversize_response")
                     check_disk(root, reserve, len(data))
                     out.write(data)
+                    if transfer_hash is not None:
+                        transfer_hash.update(data)
                     on_bytes(len(data))
                 out.flush()
                 os.fsync(out.fileno())
@@ -201,6 +299,9 @@ def download(source, route, item_id, expected_size, expected_hash, root, timeout
         raise SourceError("retry_wait", "interrupted_download") from None
     if part.stat().st_size < expected_size:
         raise SourceError("retry_wait", "short_download")
+    if transfer_hash is not None:
+        expected_hash = transfer_hash.hexdigest()
+        hash_type = "sha256"
     if not valid(part):
         part.unlink(missing_ok=True)
         raise SourceError("retry_wait", "checksum_mismatch")
@@ -382,6 +483,7 @@ class Worker:
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.active = None
+        self.required_free_bytes = 0
 
     def post(self, action, data):
         return self.api.post("workers/" + self.id + "/" + action, data)
@@ -390,6 +492,11 @@ class Worker:
         with self.lock:
             active = self.active
         payload = dict(metrics=self.metrics.snapshot())
+        with self.lock:
+            free_bytes = round(payload["metrics"]["free_space_gb"] * 2**30)
+            if free_bytes >= self.required_free_bytes:
+                self.required_free_bytes = 0
+            payload["metrics"]["disk_blocked"] = bool(self.required_free_bytes)
         payload["metrics"]["coordinator_timeouts"] = getattr(self.api, "coordinator_timeouts", 0)
         if active:
             payload.update(active[0])
@@ -443,6 +550,7 @@ class Worker:
     def run_chunk(self, chunk):
         envelope = {"chunk_id": chunk["id"], "attempt": chunk["attempt"]}
         cancel_event = threading.Event()
+        failure_report = {"error": "lease_interrupted"}
         self.threads = max(1, min(512, int(chunk.get("threads", self.threads))))
         with self.lock:
             self.active = (envelope, cancel_event)
@@ -471,28 +579,69 @@ class Worker:
                         raise
                     pause(0.5)
 
-        def permit(kind):
+        def permit(kind, request=call):
             while True:
                 # Reserve both limits together. A rejected global request consumes no local slot.
                 keys = [key for key in ("all", kind) if self.rates[key]]
                 with self.rate_lock if keys else contextlib.nullcontext():
                     local_wait = max((self.next_allowed[k]-time.monotonic() for k in keys), default=0)
                     if local_wait <= 0:
-                        reply = call("permit", {"kind": kind})
+                        reply = request("permit", {"kind": kind})
                         if reply.get("granted"):
                             for key in keys:
                                 self.next_allowed[key] = time.monotonic() + 1/self.rates[key]
                             self.metrics.add("http_requests")
                             return
                         local_wait = max(0.01, float(reply.get("wait", 0.1)))
+                    else:
+                        request("lifecycle", {})
                 pause(local_wait)
 
         def process(item):
             status = None
+            seq = 0
+            transitions = []
+            last_state = None
+
+            def track(state):
+                nonlocal seq, last_state
+                seq += 1
+                last_state = state
+                transitions.append({"seq": seq, "status": state})
+
+            def report_call(action, payload):
+                nonlocal seq, last_state
+                if action == "lifecycle" and not transitions:
+                    return {}
+                if transitions:
+                    payload = {**payload, "external_id": item, "transitions": list(transitions)}
+                request_download = (action == "permit" and payload.get("kind") == "download"
+                                    and "result_status" not in payload and last_state != "downloading")
+                if request_download:
+                    payload = {**payload, "external_id": item, "download_seq": seq + 1}
+                reply = call(action, payload)
+                transitions.clear()
+                if request_download and reply.get("granted"):
+                    seq += 1
+                    last_state = "downloading"
+                    self.metrics.update(item, status="downloading")
+                return reply
+
             try:
-                report = self.process_item(item, chunk, permit, cancel, pause, call)
-                call("progress", {"external_id": item, **report})
+                report = self.process_item(item, chunk, lambda kind: permit(kind, report_call),
+                                           cancel, pause, report_call, track)
+                report_call("progress", {"external_id": item, **report})
                 status = report["status"]
+            except DiskUnavailable as exc:
+                # Store this before waking the other futures: a Cancelled result may
+                # reach the dispatcher before the future that saw the actual I/O error.
+                with self.lock:
+                    self.required_free_bytes = max(self.required_free_bytes, exc.required_free_bytes)
+                    failure_report["error"] = "insufficient_disk"
+                    if transitions and "transitions" not in failure_report:
+                        failure_report.update(external_id=item, transitions=list(transitions))
+                cancel_event.set()
+                raise
             except BaseException:
                 cancel_event.set()
                 raise
@@ -525,14 +674,13 @@ class Worker:
             cancel_event.set()
             # The coordinator verifies the fencing token even on a failure report.
             with contextlib.suppress(APIError):
-                self.post("fail", dict(envelope, error="lease_interrupted"))
+                self.post("fail", {**envelope, **failure_report})
         finally:
             with self.lock:
                 self.active = None
 
-    def process_item(self, item, chunk, permit, cancel, pause, call):
+    def process_item(self, item, chunk, permit, cancel, pause, call, track=lambda state: None):
         meta = {}
-        route = "/media/" + str(item)
         phase = "check"
         timeout = float(chunk.get("request_timeout_seconds", 20))
         retries = int(chunk.get("max_retries", 4))
@@ -541,38 +689,36 @@ class Worker:
             cancel()
             try:
                 if phase == "check":
+                    track("checking")
                     self.metrics.update(item, status="checking")
-                    permit("check")
                     started = time.monotonic()
-                    with self.source.open(route, timeout) as response:
-                        self.metrics.http_status(response.status)
-                        raw = response.read(65537)
+                    data = self.source.metadata(item, timeout, permit, self.metrics.http_status)
                     self.metrics.timing("check", time.monotonic()-started)
-                    if len(raw) > 65536:
-                        raise SourceError("failed", "oversize_metadata")
-                    data = json.loads(raw)
                     if not isinstance(data, dict) or type(data.get("id")) is not int or data["id"] != item:
                         raise SourceError("failed", "invalid_metadata")
-                    page_url = data.get("source_url")
-                    if page_url != f"https://kinescope.io/{item}":
-                        page_url = self.source.url(route)
                     meta = dict(id=item, title=str(data.get("title", ""))[:1024],
-                                source_url=page_url, discovered_at=stamp())
+                                source_url=data["source_url"], discovered_at=stamp())
                     self.metrics.add("found")
+                    track("found")
                     if data.get("download_allowed") is not True:
                         return {"status": "skipped", "metadata": meta}
                     download_url = self.source.url(data["download_url"])
-                    meta.update(download_url=download_url, size=data["size"], sha256=data["sha256"],
+                    hash_type = "md5" if "md5" in data else "sha256"
+                    checksum = data[hash_type]
+                    meta.update(download_url=download_url.partition("?")[0], size=data["size"],
                                 mime_type=str(data["mime_type"])[:200])
                     phase = "download"
-                self.metrics.update(item, status="downloading", title=meta["title"], bytes=0, size=meta["size"])
+                track("download_queued")
+                self.metrics.update(item, status="download_queued", title=meta["title"], bytes=0, size=meta["size"])
                 started = time.monotonic()
                 def on_start(status, offset):
                     self.metrics.http_status(status)
                     self.metrics.update(item, bytes=offset)
-                path = download(self.source, meta["download_url"], item, meta["size"], meta["sha256"],
+                path = download(self.source, download_url, item, meta["size"], checksum,
                                 self.root, timeout, reserve, permit, cancel,
-                                lambda n: self.metrics.bytes(item, n), on_start, mime_type=meta["mime_type"])
+                                lambda n: self.metrics.bytes(item, n), on_start, mime_type=meta["mime_type"],
+                                hash_type=hash_type)
+                meta["sha256"] = checksum.lower() if hash_type == "sha256" and checksum else digest(path, cancel)
                 self.metrics.timing("download", time.monotonic()-started)
                 meta.update(downloaded_at=stamp(), worker_id=self.id, storage_path=str(path), status="completed")
                 save_json(path.with_name("metadata.json"), meta)
@@ -582,22 +728,31 @@ class Worker:
                 return {"status":"failed", "metadata":meta, "error":"invalid_metadata"}
             except (OSError, http.client.HTTPException) as err:
                 if isinstance(err, OSError) and err.errno == 28:
-                    raise SourceError("retry_wait", "insufficient_disk") from None
+                    raise DiskUnavailable(max(reserve + 1, shutil.disk_usage(self.root).free + 1)) from None
                 failure = SourceError("retry_wait", "io_interrupted")
             except SourceError as err:
                 failure = err
             if failure.code == "insufficient_disk":
                 raise failure
+            retry = failure.status in {"retry_wait","rate_limited"} and attempt < retries
+            if failure.status == "rate_limited":
+                track("rate_limited")
+            if retry:
+                track("retry_wait")
+            sent = False
             if failure.code.startswith("http_"):
                 status = int(failure.code[5:])
                 self.metrics.http_status(status)
                 if status == 429 or status >= 500:
                     call("permit", {"kind":phase, "result_status":status, "retry_after":failure.retry_after})
-            if failure.status not in {"retry_wait","rate_limited"} or attempt == retries:
+                    sent = True
+            if not retry:
                 status = failure.status if failure.status not in {"retry_wait","rate_limited"} else "failed"
                 return {"status":status, "metadata":meta, "error":failure.code}
             self.metrics.add("retries")
-            self.metrics.update(item, status=failure.status)
+            self.metrics.update(item, status="retry_wait")
+            if not sent:
+                call("lifecycle", {})
             pause(delay_for(attempt, failure.retry_after))
 
 
@@ -605,6 +760,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--coordinator", required=True)
     parser.add_argument("--source", required=True)
+    parser.add_argument("--kinescope-index", type=Path, default=os.getenv("LAB_KINESCOPE_INDEX"),
+                        help="Numeric lab ID to workspace video ID mapping for --source kinescope")
     parser.add_argument("--storage", required=True)
     parser.add_argument("--id", required=True)
     parser.add_argument("--threads", type=int, default=8)
@@ -617,7 +774,14 @@ def main():
     token = os.environ.get("LAB_WORKER_TOKEN")
     if not token:
         parser.error("LAB_WORKER_TOKEN is required")
-    worker = Worker(Coordinator(args.coordinator, token), Fixture(args.source), args.id,
+    if args.source == "kinescope":
+        if not args.kinescope_index:
+            parser.error("--source kinescope requires --kinescope-index or LAB_KINESCOPE_INDEX")
+        source = Kinescope(json.loads(args.kinescope_index.read_text(encoding="utf-8-sig")),
+                           os.getenv("LAB_KINESCOPE_TOKEN"))
+    else:
+        source = Fixture(args.source)
+    worker = Worker(Coordinator(args.coordinator, token), source, args.id,
                     args.threads, args.storage, args.heartbeat, args.max_connections,
                     args.worker_rps, args.check_rps, args.download_rps)
     for sig in (signal.SIGINT, signal.SIGTERM):

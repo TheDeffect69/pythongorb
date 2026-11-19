@@ -50,15 +50,18 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> created: валидация при создании
-    created --> running: start
-    created --> stopped: stop
+    created --> validating: start
+    validating --> running: параметры подтверждены
+    validating --> failed: конфигурация непригодна
+    created --> stopping: stop
     running --> pausing: pause
     pausing --> paused: завершены активные блоки
     paused --> running: resume
     running --> completed: конец диапазона или условие завершения
-    running --> stopped: stop
-    pausing --> stopped: stop
-    paused --> stopped: stop
+    running --> stopping: stop
+    pausing --> stopping: stop
+    paused --> stopping: stop
+    stopping --> stopped: аренды отозваны
     completed --> running: явный retry ошибочных ID
     stopped --> running: явный retry ошибочных ID
 ```

@@ -6,6 +6,7 @@ import hmac
 import io
 import json
 import mimetypes
+import math
 import ntpath
 import os
 import posixpath
@@ -20,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import lifecycle
 from storage import connect, initialize
 
 
@@ -89,17 +91,35 @@ def identifier(value):
     return value
 
 
-JOB_FIELDS = {"name", "range", "threads", "rate_limit", "chunk_size", "worker_ids", "max_retries",
+JOB_FIELDS = {"name", "range", "threads", "rate_limit", "check_rps", "download_rps", "worker_settings",
+              "chunk_size", "worker_ids", "max_retries",
               "request_timeout_seconds", "min_free_space_gb", "max_items", "max_seconds",
               "stop_on_consecutive_missing"}
 FINAL_STATES = {"completed", "forbidden", "failed", "skipped", "not_found"}
 ROLES = {"viewer": 1, "operator": 2, "administrator": 3}
+WORKER_RATES = ("worker_rps", "check_rps", "download_rps")
+WORKER_SETTINGS = {*WORKER_RATES, "threads", "min_free_space_gb"}
 
 
 def real_number(value, label, low, high):
     if type(value) not in (int, float) or not low <= value <= high:
         raise Problem(400, f"Некорректное поле {label}")
     return float(value)
+
+
+def worker_settings(data):
+    if not isinstance(data, dict):
+        raise Problem(400, "Параметры узла должны быть объектом")
+    check_fields(data, WORKER_SETTINGS)
+    settings = {}
+    for name, value in data.items():
+        if value is None:
+            settings[name] = None
+        elif name == "min_free_space_gb":
+            settings[name] = real_number(value, name, 0, 10**9)
+        else:
+            settings[name] = integer(value, name, 1, 512 if name == "threads" else 10000)
+    return settings
 
 
 def event(db, op, result="ok", message="", job=None, worker=None, chunk=None, item=None, code=None):
@@ -129,6 +149,54 @@ def get_worker(db, wid):
     return worker
 
 
+def capacity_chunk(maximum, threads, lease_seconds, samples):
+    """Estimate work for one pull from recent measurements on that same worker."""
+    def counter(metrics, key):
+        value = metrics.get(key)
+        return value if type(value) in (int,float) and 0 <= value <= 2**63 else None
+
+    target = maximum
+    speeds = [counter(m, "processed_per_second") for _, m in samples]
+    active_speeds = [speed for speed in speeds if speed]
+    if active_speeds:
+        # Idle intervals between pulls are not measurements of processing capacity.
+        speed = sum(active_speeds) / len(active_speeds)
+        target = min(target, max(threads, speed * lease_seconds / 2))
+
+    io_intervals = {"network": [], "disk": []}
+    failures = processed = 0
+    for (start, prev), (end, curr) in zip(samples, samples[1:]):
+        elapsed = end - start
+        if elapsed <= 0:
+            continue
+        def change(key):
+            before, after = counter(prev,key), counter(curr,key)
+            if before is None or after is None or after < before:
+                return None
+            return after-before
+        errors, finished = change("errors"), change("processed")
+        if errors is not None and finished is not None:
+            failures += errors
+            processed += finished
+        for kind, keys in (("network", ("network_rx_bytes","network_tx_bytes")),
+                           ("disk", ("disk_read_bytes","disk_write_bytes"))):
+            deltas = [change(k) for k in keys]
+            if all(n is not None for n in deltas):
+                io_intervals[kind].append(sum(deltas)/elapsed)
+
+    # When throughput drops while the device or network is busier than usual,
+    # reduce this pull, without assuming a fixed bandwidth for heterogeneous hosts.
+    if len(active_speeds) >= 2 and speeds[-1] is not None:
+        typical = sum(active_speeds[:-1]) / len(active_speeds[:-1])
+        if speeds[-1] < 0.75 * typical:
+            for rates in io_intervals.values():
+                if len(rates)>=2 and rates[-1] > 2 * max(1, sum(rates[:-1])/len(rates[:-1])):
+                    target *= 0.75
+    if failures:
+        target /= 1 + 3 * min(1, failures/max(1,processed))
+    return max(1, min(maximum, math.ceil(target)))
+
+
 def job_config(data, defaults=None):
     defaults = defaults or {}
     limits = {"threads": (4, 1, 512), "rate_limit": (20, 1, 10000),
@@ -136,6 +204,9 @@ def job_config(data, defaults=None):
               "request_timeout_seconds": (20, 1, 3600)}
     config = {key: integer(data.get(key, defaults.get(key, default)), key, low, high)
               for key, (default, low, high) in limits.items()}
+    for key in ("check_rps", "download_rps"):
+        value = data.get(key, defaults.get(key))
+        config[key] = None if value is None else integer(value, key, 1, 10000)
     config["min_free_space_gb"] = real_number(data.get("min_free_space_gb", defaults.get("min_free_space_gb", 0)),
                                                "min_free_space_gb", 0, 10**9)
     for field in ("max_items", "max_seconds", "stop_on_consecutive_missing"):
@@ -256,7 +327,16 @@ class Coordinator:
         cur = db.execute(f"INSERT INTO jobs({','.join(record)}) VALUES({','.join('?' for _ in record)})",
                          list(record.values()))
         jid = cur.lastrowid
-        db.executemany("INSERT INTO job_workers VALUES(?,?)", [(jid,wid) for wid in chosen])
+        db.executemany("INSERT INTO job_workers(job_id,worker_id) VALUES(?,?)", [(jid,wid) for wid in chosen])
+        per_worker = data.get("worker_settings", {})
+        if not isinstance(per_worker,dict) or per_worker.keys() - chosen:
+            raise Problem(400,"worker_settings должен содержать только узлы из worker_ids")
+        for wid, values in per_worker.items():
+            settings = worker_settings(values)
+            if settings:
+                fields = ", ".join(key+"=?" for key in settings)
+                db.execute(f"UPDATE job_workers SET {fields} WHERE job_id=? AND worker_id=?",
+                           (*settings.values(), jid, wid))
         audit(db,actor,"create",job=jid)
         event(db,"create","created",job=jid)
         return self.job_summary(db,jid)
@@ -270,14 +350,28 @@ class Coordinator:
                      LEFT JOIN media_metadata m ON m.item_id=i.id LEFT JOIN downloads d ON d.item_id=i.id
                      LEFT JOIN files f ON f.download_id=d.id WHERE i.job_id=?""",jid)
         job.update(stats)
-        elapsed=max(0.001,(job["updated_at"] if job["status"] in ("completed","stopped","failed") else time.time())
-                    -(job["started_at"] or time.time()))
-        job["speed"]=job["processed"]/elapsed
-        job["download_speed"]=job["bytes_downloaded"]/elapsed
-        job["eta_seconds"]=None
-        if job["range_end"] is not None and job["speed"]:
-            job["eta_seconds"]=max(0,job["range_end"]-job["range_start"]+1-job["processed"])/job["speed"]
+        observed = job["updated_at"] if job["status"] in ("paused","completed","stopped","failed") else time.time()
+        elapsed = observed - job["started_at"] if job["started_at"] is not None else 0
+        job["speed"] = job["processed"] / elapsed if elapsed > 0 else 0
+        job["download_speed"] = job["bytes_downloaded"] / elapsed if elapsed > 0 else 0
+        total = job["max_items"]
+        if job["range_end"] is not None:
+            count = job["range_end"] - job["range_start"] + 1
+            total = min(count, total) if total is not None else count
+        job["total_items"] = total
+        job["progress_percent"] = min(100, 100 * job["processed"] / total) if total else None
+        job["eta_seconds"] = None
+        if job["range_end"] is not None:
+            if job["status"] == "completed":
+                job["eta_seconds"] = 0
+            elif job["status"] == "running" and job["speed"] > 0:
+                job["eta_seconds"] = max(0, total - job["processed"]) / job["speed"]
         job["worker_ids"]=[r[0] for r in db.execute("SELECT worker_id FROM job_workers WHERE job_id=?",(jid,))]
+        job["worker_settings"]={}
+        for member in rows(db, "SELECT * FROM job_workers WHERE job_id=?",jid):
+            overrides={key:member[key] for key in WORKER_SETTINGS if member[key] is not None}
+            if overrides:
+                job["worker_settings"][member["worker_id"]]=overrides
         queue=row(db,"SELECT count(*) AS queued,min(updated_at) AS oldest FROM range_chunks WHERE job_id=? AND status='queued'",jid)
         job["queued_chunks"]=queue["queued"]
         job["queue_size"]=queue["queued"]
@@ -290,18 +384,23 @@ class Coordinator:
         self.reap(db)
         job=get_job(db,jid)
         if op=="edit":
-            check_fields(data,{"threads","rate_limit","min_free_space_gb","worker_ids"})
+            check_fields(data,{"threads","rate_limit","check_rps","download_rps","min_free_space_gb","worker_ids"})
             config=job_config(data,job)
-            db.execute("UPDATE jobs SET threads=?,rate_limit=?,min_free_space_gb=?,updated_at=? WHERE id=?",
-                       (config["threads"],config["rate_limit"],config["min_free_space_gb"],time.time(),jid))
+            db.execute("""UPDATE jobs SET threads=?,rate_limit=?,check_rps=?,download_rps=?,
+                       min_free_space_gb=?,updated_at=? WHERE id=?""",
+                       (config["threads"],config["rate_limit"],config["check_rps"],config["download_rps"],
+                        config["min_free_space_gb"],time.time(),jid))
             if "worker_ids" in data:
                 chosen=data["worker_ids"]
                 if not isinstance(chosen,list):
                     raise Problem(400,"Некорректный список узлов")
-                db.execute("DELETE FROM job_workers WHERE job_id=?",(jid,))
-                for wid in {identifier(w) for w in chosen}:
+                members={identifier(w) for w in chosen}
+                for existing in rows(db,"SELECT worker_id FROM job_workers WHERE job_id=?",jid):
+                    if existing["worker_id"] not in members:
+                        db.execute("DELETE FROM job_workers WHERE job_id=? AND worker_id=?",(jid,existing["worker_id"]))
+                for wid in members:
                     get_worker(db,wid)
-                    db.execute("INSERT INTO job_workers VALUES(?,?)",(jid,wid))
+                    db.execute("INSERT OR IGNORE INTO job_workers(job_id,worker_id) VALUES(?,?)",(jid,wid))
                 db.execute("UPDATE jobs SET restricted_workers=? WHERE id=?",(bool(chosen),jid))
         elif op=="retry":
             if job["status"] not in ("completed","stopped","paused","failed"):
@@ -323,7 +422,26 @@ class Coordinator:
             states,status=allowed[op]
             if job["status"] not in states:
                 raise Problem(409,"Недопустимый переход из состояния "+job["status"])
+            if op == "start":
+                db.execute("UPDATE jobs SET status='validating',updated_at=? WHERE id=?", (time.time(), jid))
+                event(db, "start", "validating", job=jid)
+                # A saved job can outlive a coordinator release or an inventory change.
+                try:
+                    parse_range({"from":job["range_start"], "to":job["range_end"]})
+                    job_config({}, job)
+                    assigned = rows(db, "SELECT * FROM job_workers WHERE job_id=?", jid)
+                    if job["restricted_workers"] and not assigned:
+                        raise Problem(400, "У задания отсутствуют назначенные узлы")
+                    for member in assigned:
+                        get_worker(db, member["worker_id"])
+                        worker_settings({k:member[k] for k in WORKER_SETTINGS if member[k] is not None})
+                except Problem:
+                    self.finish(db, jid, "failed", "invalid_saved_configuration")
+                    audit(db, actor, op, job=jid)
+                    return self.job_summary(db, jid)
             if op=="stop":
+                db.execute("UPDATE jobs SET status='stopping',updated_at=? WHERE id=?", (time.time(), jid))
+                event(db, "stop", "stopping", job=jid)
                 self.finish(db,jid,status,op)
             else:
                 db.execute("UPDATE jobs SET status=?,started_at=coalesce(started_at,?),updated_at=? WHERE id=?",
@@ -352,6 +470,10 @@ class Coordinator:
                  VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,version=excluded.version,
                  storage_path=excluded.storage_path,threads=excluded.threads,last_heartbeat=excluded.last_heartbeat""",
                    (wid,name,version,path,threads,time.time(),time.time()))
+        # A fresh process cannot resume the old process's transition sequence. Fence it
+        # and issue a new generation; confirmed results are excluded from the new lease.
+        db.execute("""UPDATE range_chunks SET status='queued',leased_by=NULL,lease_expires_at=NULL,
+                   updated_at=? WHERE status='leased' AND leased_by=?""", (time.time(), wid))
         event(db,"register",worker=wid)
         audit(db,"agent:"+wid,"register",worker=wid)
         return {"id":wid}
@@ -374,6 +496,24 @@ class Coordinator:
         w["current_chunk"]=row(db,"SELECT id,job_id,range_start,range_end,next_id FROM range_chunks WHERE leased_by=? AND status='leased'",wid)
         return w
 
+    def edit_worker(self, db, wid, data, actor):
+        worker = get_worker(db, wid)
+        check_fields(data, WORKER_SETTINGS | {"enabled"})
+        enabled = data.get("enabled", bool(worker["enabled"]))
+        if type(enabled) is not bool:
+            raise Problem(400,"enabled должен быть логическим значением")
+        settings = worker_settings({k:v for k,v in data.items() if k != "enabled"})
+        if "threads" in settings:
+            settings["thread_override"] = settings.pop("threads")
+        settings["enabled"] = enabled
+        fields = ", ".join(key+"=?" for key in settings)
+        db.execute(f"UPDATE workers SET {fields} WHERE id=?", (*settings.values(), wid))
+        if not enabled:
+            db.execute("""UPDATE range_chunks SET status='queued',leased_by=NULL,lease_expires_at=NULL
+                          WHERE status='leased' AND leased_by=?""",(wid,))
+        audit(db,actor,"edit_worker",worker=wid)
+        return self.worker_summary(db,wid)
+
     def lease(self,db,wid):
         self.reap(db)
         w=get_worker(db,wid)
@@ -384,9 +524,11 @@ class Coordinator:
         if previous:
             return self.lease_payload(db,previous,get_job(db,previous["job_id"]),w)
         for job in rows(db,"""SELECT * FROM jobs WHERE status='running' AND (restricted_workers=0 OR
-                    EXISTS(SELECT 1 FROM job_workers WHERE job_id=jobs.id AND worker_id=?)) ORDER BY id""",wid):
+                    EXISTS(SELECT 1 FROM job_workers WHERE job_id=jobs.id AND worker_id=?))
+                    ORDER BY last_dispatched_at,id""",wid):
+            local=self.assignment_settings(db, job, w)
             free=w["metrics"].get("free_space_gb",0)
-            if type(free) not in (float,int) or free<job["min_free_space_gb"] or self.overloaded(w):
+            if type(free) not in (float,int) or free<local["min_free_space_gb"] or self.overloaded(w):
                 continue
             c=row(db,"SELECT * FROM range_chunks WHERE job_id=? AND status='queued' ORDER BY id LIMIT 1",job["id"])
             if c is None:
@@ -395,7 +537,7 @@ class Coordinator:
                     self.finish_if_done(db,job)
                     continue
                 lo=job["next_start"]
-                hi=min(lo+job["chunk_size"]-1,end)
+                hi=min(lo+self.scheduled_size(db, job, w, local["threads"])-1,end)
                 cur=db.execute("""INSERT INTO range_chunks(job_id,range_start,range_end,next_id,status,created_at,updated_at)
                                 VALUES(?,?,?,?,'queued',?,?)""",(job["id"],lo,hi,lo,time.time(),time.time()))
                 db.execute("UPDATE jobs SET next_start=? WHERE id=?",(hi+1,job["id"]))
@@ -403,6 +545,7 @@ class Coordinator:
             else:
                 cid=c["id"]
             now=time.time()
+            db.execute("UPDATE jobs SET last_dispatched_at=? WHERE id=?",(now,job["id"]))
             db.execute("""UPDATE range_chunks SET status='leased',leased_by=?,leased_at=?,lease_expires_at=?,
                        attempt=attempt+1,updated_at=? WHERE id=?""",(wid,now,now+self.lease_seconds,now,cid))
             c=row(db,"SELECT * FROM range_chunks WHERE id=?",cid)
@@ -411,12 +554,29 @@ class Coordinator:
         return {"chunk":None}
 
     @staticmethod
+    def assignment_settings(db, job, worker):
+        overrides = row(db, "SELECT * FROM job_workers WHERE job_id=? AND worker_id=?", job["id"], worker["id"]) or {}
+        threads = overrides.get("threads") or worker["thread_override"] or min(job["threads"], worker["threads"])
+        reserve = overrides.get("min_free_space_gb")
+        if reserve is None:
+            reserve = job["min_free_space_gb"]
+        return {"threads":threads, "min_free_space_gb":max(reserve,worker["min_free_space_gb"] or 0)}
+
+    def scheduled_size(self, db, job, worker, threads):
+        # Target half a lease of observed work. Preserve existing chunk boundaries on takeover.
+        fresh_after = time.time() - max(60, self.heartbeat_seconds * 12)
+        snapshots = rows(db, """SELECT ts,data FROM worker_metrics WHERE worker_id=? AND ts>=?
+                             ORDER BY id DESC LIMIT 8""", worker["id"], fresh_after)
+        samples = [(record["ts"], json.loads(record["data"])) for record in reversed(snapshots)]
+        return capacity_chunk(job["chunk_size"], threads, self.lease_seconds, samples)
+
+    @staticmethod
     def overloaded(w):
         metrics=w["metrics"]
         def metric(key):
             val=metrics.get(key)
             return val if type(val) in (int,float) else 0
-        return (bool(metrics.get("overloaded")) or metric("cpu_percent")>=98 or
+        return (bool(metrics.get("overloaded")) or bool(metrics.get("disk_blocked")) or metric("cpu_percent")>=98 or
                 metric("ram_total_bytes")>0 and metric("ram_used_bytes")/metric("ram_total_bytes")>=0.98 or
                 metric("active_checks")+metric("active_downloads")>= (w["thread_override"] or w["threads"]))
 
@@ -430,7 +590,7 @@ class Coordinator:
     def lease_payload(self,db,c,job,w):
         c=dict(c)
         c.update({k:job[k] for k in ("rate_limit","max_retries","request_timeout_seconds","min_free_space_gb")})
-        c["threads"]=w["thread_override"] or min(job["threads"],w["threads"])
+        c.update(self.assignment_settings(db,job,w))
         c["skip_ids"]=[r[0] for r in db.execute("SELECT external_id FROM items WHERE chunk_id=? AND external_id>=?",
                                                 (c["id"],c["next_id"]))]
         return {"chunk":c}
@@ -469,7 +629,7 @@ class Coordinator:
                     db.execute("UPDATE range_chunks SET lease_expires_at=?,updated_at=? WHERE id=?",
                                (now+self.lease_seconds,now,c["id"]))
                     action="continue"
-                    threads=w["thread_override"] or min(job["threads"],w["threads"])
+                    threads=self.assignment_settings(db,job,w)["threads"]
                 else:
                     action="stop"
         return {"action":action,"threads":threads,"lease_seconds":self.lease_seconds}
@@ -481,11 +641,18 @@ class Coordinator:
         job=get_job(db,c["job_id"])
         key=f"job/{job['id']}"
         now=time.time()
-        rate=job["rate_limit"]
-        # One shared budget across agents, with additional per-worker and per-kind ceilings.
-        keys=[key, key+"/"+wid, key+"/"+kind]
+        kind_field = kind + "_rps"
+        node = row(db, f"SELECT worker_rps,{kind_field} FROM workers WHERE id=?", wid)
+        local = row(db, f"SELECT worker_rps,{kind_field} FROM job_workers WHERE job_id=? AND worker_id=?",
+                    job["id"], wid) or {}
+        # A permit consumes one token in every configured scope, across all applicable jobs and nodes.
+        limits = {key:job["rate_limit"], key+"/kind/"+kind:job[kind_field],
+                  "worker/"+wid:node["worker_rps"], "worker/"+wid+"/kind/"+kind:node[kind_field],
+                  key+"/worker/"+wid:local.get("worker_rps"),
+                  key+"/worker/"+wid+"/kind/"+kind:local.get(kind_field)}
+        limits = {scope:rate for scope,rate in limits.items() if rate is not None}
         budgets=[]
-        for k in keys:
+        for k in limits:
             b=row(db,"SELECT * FROM rate_buckets WHERE key=?",k)
             if b is None:
                 b=dict(tokens=1.,updated=now,blocked_until=0.,scale=1.)
@@ -495,13 +662,15 @@ class Coordinator:
         if result is not None:
             integer(result,"result_status",100,599)
             if result==429 or result>=500:
-                wait=real_number(data.get("retry_after",1) or 1,"retry_after",0,86400)
+                value = data.get("retry_after")
+                wait=real_number(1 if value is None else value,"retry_after",0,86400)
                 db.execute("UPDATE rate_buckets SET blocked_until=max(blocked_until,?),scale=max(0.05,scale/2),tokens=0,updated=? WHERE key=?",
                            (now+wait,now,key))
                 event(db,"rate_limit","limited","Снижение частоты запросов",job["id"],wid,c["id"],code=str(result))
+                return {"granted":False,"wait":max(wait,budgets[0]["blocked_until"]-now)}
             return {"granted":False,"wait":max(0,budgets[0]["blocked_until"]-now)}
         wait=0.
-        for b in budgets:
+        for rate,b in zip(limits.values(),budgets):
             scale=min(1.,b["scale"]+max(0,now-b["updated"])/60)
             b["effective"]=rate*scale
             b["scale"]=scale
@@ -510,7 +679,7 @@ class Coordinator:
             wait=max(wait,b["blocked_until"]-now,(1-b["available"])/b["effective"])
         if wait>0:
             return {"granted":False,"wait":round(wait+0.001,4)}
-        for k,b in zip(keys,budgets):
+        for k,b in zip(limits,budgets):
             db.execute("UPDATE rate_buckets SET tokens=?,updated=?,scale=? WHERE key=?",(b["available"]-1,now,b["scale"],k))
         return {"granted":True,"wait":0}
 
@@ -578,8 +747,22 @@ class Coordinator:
         if op=="lease":
             return self.lease(db,wid)
         c=self.current(db,wid,data)
+        if op in ("permit","progress","lifecycle","fail") and "transitions" in data:
+            try:
+                lifecycle.record(db,c,wid,data)
+            except ValueError as exc:
+                raise Problem(400,str(exc)) from None
+        if op=="lifecycle":
+            return {"ok":True}
         if op=="permit":
-            return self.permit(db,wid,data,c)
+            reply=self.permit(db,wid,data,c)
+            if "download_seq" in data and reply.get("granted") and data.get("kind")=="download":
+                transition={"seq":data["download_seq"],"status":"downloading"}
+                try:
+                    lifecycle.record(db,c,wid,{"external_id":data.get("external_id"),"transitions":[transition]})
+                except ValueError as exc:
+                    raise Problem(400,str(exc)) from None
+            return reply
         if op=="progress":
             return self.progress(db,wid,c,data)
         if op not in ("complete","fail"):
@@ -590,6 +773,7 @@ class Coordinator:
         if op=="fail" and data.get("error")=="insufficient_disk":
             w=get_worker(db,wid)
             w["metrics"]["free_space_gb"]=0
+            w["metrics"]["disk_blocked"]=True
             db.execute("UPDATE workers SET metrics=? WHERE id=?",(json.dumps(w["metrics"]),wid))
         db.execute("UPDATE range_chunks SET status=?,leased_by=NULL,lease_expires_at=NULL,updated_at=? WHERE id=?",
                    (new_status,time.time(),c["id"]))
@@ -833,6 +1017,13 @@ class Handler(BaseHTTPRequestHandler):
                     return svc.job_summary(db,jid)
                 if p[2:]==["events"]:
                     return select_log(db,q,jid)
+                if p[2:]==["states"]:
+                    return lifecycle.states(db,jid,q,page_param(q,"limit",100,5000),page_param(q,"offset",0,MAX_ID))
+                if len(p)==5 and p[2]=="items" and p[4]=="history":
+                    if not re.fullmatch(r"[0-9]{1,19}",p[3]):
+                        raise Problem(400,"Некорректный ID материала")
+                    eid=integer(int(p[3]),"external_id")
+                    return lifecycle.history(db,jid,eid,page_param(q,"limit",100,5000),page_param(q,"offset",0,MAX_ID))
                 if p[2:]==["items"]:
                     if q.get("format")==["csv"]:
                         output=io.StringIO(newline="")
@@ -873,21 +1064,7 @@ class Handler(BaseHTTPRequestHandler):
             return svc.worker_op(db,actor,p[2],data)
         elif len(p)==2 and p[0]=="workers" and method=="PATCH":
             require("operator")
-            wid=identifier(p[1])
-            w=get_worker(db,wid)
-            check_fields(data,{"enabled","threads"})
-            enabled=data.get("enabled",bool(w["enabled"]))
-            if type(enabled) is not bool:
-                raise Problem(400,"enabled должен быть логическим значением")
-            threads=data.get("threads",w["thread_override"])
-            if threads is not None:
-                integer(threads,"threads",1,512)
-            db.execute("UPDATE workers SET enabled=?,thread_override=? WHERE id=?",(enabled,threads,wid))
-            if not enabled:
-                db.execute("""UPDATE range_chunks SET status='queued',leased_by=NULL,lease_expires_at=NULL
-                              WHERE status='leased' AND leased_by=?""",(wid,))
-            audit(db,actor,"edit_worker",worker=wid)
-            return svc.worker_summary(db,wid)
+            return svc.edit_worker(db,identifier(p[1]),data,actor)
         elif p and p[0]=="jobs":
             require("operator")
             if len(p)==1 and method=="POST":
